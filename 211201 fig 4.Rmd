@@ -1,0 +1,393 @@
+---
+title: "Fig 4"
+author: "Ning Chin"
+date: "8/16/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Setup
+```{r, warning = FALSE, message = FALSE}
+library(phyloseq)
+library(ggplot2)
+library(cowplot)
+library(qvalue)
+library(kableExtra)
+
+set.seed(7)
+
+set.color <- as.character(c("#DD1717", "#000249", "#FF4949", "#0F4392", 
+                            "#FCCDE5", "#8DD3C7", "#FFFFB3", "#80B1D3", "#FB8072", "#BC80BD",
+                            "#FFED6F", "#D9D9D9", "#BEBADA", "#CCEBC5", "#FDB462", "#B3DE69"))
+names(set.color) <- c("NEG", "POS", "prev", "posv",
+                      "Actinobacteria", "Bacteroidetes", "Cyanobacteria", "Elusimicrobia", "Fibrobacteres", "Firmicutes",
+                      "Proteobacteria", "Spirochaetes", "Tenericutes", "TM7", "Verrucomicrobia", "WPS-2")
+
+t.labs <- c("RhCMV-", "RhCMV+")
+names(t.labs) <- c("NEG", "POS")
+
+theme_set(theme_grey()+
+            theme(panel.grid = element_blank(),
+                  panel.background = element_blank(),
+                  panel.border = element_rect(fill = NA, colour = "black", size = 0.2),
+                  axis.title = element_text(size = 10),
+                  axis.text = element_text(size = 6),
+                  axis.line = element_line(color = "black", size = 0.2),
+                  strip.text = element_text(size = 8, margin = margin(1, 1, 1, 1, "pt"), face = "bold"),
+                  legend.title = element_text(size = 8, face = "bold"),
+                  legend.text = element_text(size = 6),
+                  legend.key = element_blank(),
+                  legend.key.size = unit(10, "pt"),
+                  panel.spacing = unit(2, "pt")))
+```
+
+## Filtering
+```{r}
+filterfunc <- function(psobj, prevpercent, maxpercent) {
+  ps0 <- subset_taxa(psobj, !is.na(Phylum))
+  ps1 <- tax_glom(ps0, "Genus", NArm = TRUE)
+  prevalence <- apply(otu_table(ps1), 2, function(x) sum(x > 0)/nsamples(ps1))
+  maxpercentage <- apply(otu_table(ps1), 1, function(x) x/sum(x)*100)
+  maxpercentage <- apply(maxpercentage, 1, function(x) max(x))
+  keepTaxa <- names(prevalence)[(prevalence >= prevpercent & maxpercentage > maxpercent)]
+  ps2 <- prune_taxa(keepTaxa, ps1)
+  return(ps2)
+}
+
+ps0 <- readRDS("../phyloseq_GG_tree_190304.RData")
+ps <- filterfunc(ps0, 0.5, 0.01)
+dim(tax_table(ps))
+ps.log <- transform_sample_counts(ps, function(x) log2(x + 1))
+bac <- data.frame(otu_table(ps.log))
+colnames(bac) <- data.frame(tax_table(ps))$Genus
+colnames(bac) <- gsub("g__", "", colnames(bac))
+
+mtdata <- read.csv("../metadata.csv", stringsAsFactors = TRUE)
+# center the age
+mtdata$Age_c <- mtdata$Age - mean(mtdata$Age)
+
+imm <- read.csv("../cor_w_immune/190627_CUR01_immune_data.csv", row.names = 1)
+immlabs <- read.delim("../211202 pretty_labels_imm.txt")
+
+# rearrange colnames based on cell type using pre-arranged txt
+imm <- imm[,immlabs$imm]
+colnames(imm) <- immlabs$label
+
+# add note for function of genera
+scfa.func <- read.delim("../211202 pretty_bac_function.txt")
+```
+
+
+## Run mixed-model analysis, taking age into account
+```{r}
+tmp1 <- list()
+for (i in colnames(imm)){
+  y <- scale(imm)[,i]
+  tmp2 <- list()
+  for (j in colnames(bac)){
+    x <- scale(bac)[,j]
+    mod <- lm(y ~ x*mtdata$CMV + mtdata$Age_c)
+    negmod <- lm(y[mtdata$CMV == "NEG"] ~ x[mtdata$CMV == "NEG"] + mtdata$Age_c[mtdata$CMV == "NEG"])
+    posmod <- lm(y[mtdata$CMV == "POS"] ~ x[mtdata$CMV == "POS"] + mtdata$Age_c[mtdata$CMV == "POS"])
+    tmp2[[j]] <- data.frame(imm = i,
+                            bac = j,
+                            CMVneg.p = summary(negmod)$coefficients[2,4],
+                            CMVpos.p = summary(posmod)$coefficients[2,4],
+                            int.neg.coef = mod$coefficients[2],
+                            int.pos.coef = mod$coefficients[5] + mod$coefficients[2],
+                            int.xlm.p = summary(mod)$coefficients[2,4],
+                            int.CMV.p = summary(mod)$coefficients[3,4],
+                            int.term.p = summary(mod)$coefficients[5,4],
+                            int.adj.R2 = summary(mod)$adj.r.squared,
+                            int.p.model = pf(summary(mod)$fstatistic[1], summary(mod)$fstatistic[2], summary(mod)$fstatistic[3], lower.tail = F),
+                            int.resid.norm = shapiro.test(resid(mod))$p.value,
+                            int.resid.bp = lmtest::bptest(mod)$p.value)
+  }
+  tmp3 <- do.call(rbind, tmp2)
+  tmp3$CMVneg.q <- qvalue(tmp3$CMVneg.p, lambda = 0, fdr.level = 0.05)$qvalues
+  tmp3$CMVpos.q <- qvalue(tmp3$CMVpos.p, lambda = 0, fdr.level = 0.05)$qvalues
+  tmp3$int.term.q <- qvalue(tmp3$int.term.p, lambda = 0, fdr.level = 0.05)$qvalues
+  tmp1[[i]] <- tmp3
+}
+
+pe <- do.call(rbind, tmp1)
+
+# create column to assess if model pass basic model check
+pe$mod.check <- ifelse(pe$int.resid.bp > 0.05 & pe$int.resid.norm > 0.05 &
+                         pe$int.p.model < 0.05 & pe$int.term.p < 0.05, "pass0.05",
+                       ifelse(pe$int.resid.bp > 0.05 & pe$int.resid.norm > 0.05 &
+                                pe$int.p.model < 0.05 & pe$int.term.p < 0.1, "pass0.1", "fail"))
+
+# how many significantly changed relationships at interaction p < 0.05 vs. p < 0.1?
+nrow(pe[pe$mod.check == "pass0.05" & (pe$CMVneg.p < 0.05 | pe$CMVpos.p < 0.05),])
+nrow(pe[pe$mod.check == "pass0.1" & (pe$CMVneg.p < 0.05 | pe$CMVpos.p < 0.05),])
+
+# how many relationships are only in CMV- animals?
+nrow(pe[pe$mod.check != "fail" & pe$CMVneg.p < 0.05 & pe$CMVpos.p > 0.05,])
+nrow(pe[pe$mod.check == "pass0.05" & pe$CMVneg.p < 0.05 & pe$CMVpos.p > 0.05,])
+
+# how many relationship are only in CMV+ animals?
+nrow(pe[pe$mod.check != "fail" & pe$CMVneg.p > 0.05 & pe$CMVpos.p < 0.05,])
+nrow(pe[pe$mod.check == "pass0.05" & pe$CMVneg.p > 0.05 & pe$CMVpos.p < 0.05,])
+
+# how many relationship are significant in both CMV- and CMV+ animals?
+nrow(pe[pe$mod.check == "pass0.05" & pe$CMVneg.p < 0.05 & pe$CMVpos.p < 0.05,])
+```
+
+## Table 2
+```{r}
+# make pretty table for table 2
+table2 <- pe[pe$mod.check == "pass0.05" & (pe$CMVneg.p < 0.05 | pe$CMVpos.p < 0.05),
+             c("bac", "imm", "CMVneg.p", "int.neg.coef", "CMVpos.p", "int.pos.coef", "int.term.p", "int.adj.R2")]
+table2$CMVneg.p <- round(table2$CMVneg.p, 4)
+table2$int.neg.coef <- round(table2$int.neg.coef, 2)
+table2$CMVpos.p <- round(table2$CMVpos.p, 4)
+table2$int.pos.coef <- round(table2$int.pos.coef, 2)
+table2$int.term.p <- round(table2$int.term.p, 4)
+table2$int.adj.R2 <- round(table2$int.adj.R2, 2)
+table2$moresig <- ifelse(table2$CMVneg.p < 0.05 & table2$CMVpos.p > 0.05, "RhCMV- only",
+                         ifelse(table2$CMVneg.p > 0.05 & table2$CMVpos.p < 0.05, "RhCMV+ only", "Both RhCMV- and RhCMV+"))
+
+table2 <- table2[with(table2, order(moresig, bac, int.term.p)),]
+
+# add function of bac
+table2 <- dplyr::left_join(table2, scfa.func, by = "bac")
+table2$bac <- ifelse(table2$SCFA.production == "Gram+ producer", paste0(table2$bac, "a"),
+                     ifelse(table2$SCFA.production == "Gram- producer", paste0(table2$bac, "b"), table2$bac))
+
+colnames(table2) <- c("Bacterial genus", "Immune marker", "n.P", "n.Coeffficient", "p.P", "p.Coefficient", "P value of interaction", "Adjusted R2", "Significance in group")
+kable(table2, row.names = 0) %>% kable_styling()
+
+write.csv(table2, "211201_table2.csv", row.names = FALSE)
+```
+
+
+## Fig 4A. Correlation plot
+```{r 4a}
+# get all genera that we should plot
+bac.all <- levels(factor(pe$bac[pe$mod.check == "pass0.05" & (pe$CMVneg.p < 0.05 | pe$CMVpos.p < 0.05)]))
+
+# all immune markers that we should plot
+imm.all <- levels(factor(pe$imm[pe$mod.check == "pass0.05" & (pe$CMVneg.p < 0.05 | pe$CMVpos.p < 0.05)]))
+
+# immune markers that are significant in CMV- only
+imm.neg <- levels(factor(pe$imm[pe$mod.check == "pass0.05" & pe$CMVneg.p < 0.05 & pe$CMVpos.p > 0.05]))
+
+# immune markers that are significant in CMV+ only
+imm.pos <- levels(factor(pe$imm[pe$mod.check == "pass0.05" & pe$CMVneg.p > 0.05 & pe$CMVpos.p < 0.05]))
+
+# immune markers that are significant in both CMV- and CMV+
+imm.both <- levels(factor(pe$imm[pe$mod.check == "pass0.05" & pe$CMVneg.p < 0.05 & pe$CMVpos.p < 0.05]))
+
+# subset the relationships significant in both
+sub.both <- pe[pe$imm %in% imm.both & pe$bac %in% bac.all,]
+sub.both.long <- tidyr::gather(sub.both, "CMV", "Coefficient", c("int.neg.coef", "int.pos.coef"))
+sub.both.long$moresig <- "Sig. in both"
+sub.both.long$CMV <- ifelse(sub.both.long$CMV == "int.neg.coef", "NEG", "POS")
+
+sub.both.long$Significance <- ifelse(sub.both.long$mod.check == "pass0.05" & sub.both.long$CMVneg.p < 0.05 & sub.both.long$CMVpos.p < 0.05,
+                             "Pinteraction < 0.05",
+                             ifelse(sub.both.long$mod.check == "pass0.1" & sub.both.long$CMVneg.p < 0.05 & sub.both.long$CMVpos.p < 0.05,
+                                    "Pinteraction < 0.1", "insignificant"))
+
+# subset the relationships significant in CMV- animals only
+sub.neg <- pe[pe$imm %in% imm.neg & pe$bac %in% bac.all,]
+sub.neg.long <- tidyr::gather(sub.neg, "CMV", "Coefficient", c("int.neg.coef", "int.pos.coef"))
+sub.neg.long$moresig <- "Sig. in RhCMV- only"
+sub.neg.long$CMV <- ifelse(sub.neg.long$CMV == "int.neg.coef", "NEG", "POS")
+
+sub.neg.long$Significance <- ifelse(sub.neg.long$CMV == "NEG" & sub.neg.long$mod.check == "pass0.05" & sub.neg.long$CMVneg.p < 0.05 & sub.neg.long$CMVpos.p > 0.05,
+                            "Pinteraction < 0.05",
+                            ifelse(sub.neg.long$CMV == "NEG" & sub.neg.long$mod.check == "pass0.1" & sub.neg.long$CMVneg.p < 0.05 & sub.neg.long$CMVpos.p > 0.05,
+                                                           "Pinteraction < 0.1", "insignificant"))
+
+# subset the relationships significant in CMV+ animals only
+sub.pos <- pe[pe$imm %in% imm.pos & pe$bac %in% bac.all,]
+sub.pos.long <- tidyr::gather(sub.pos, "CMV", "Coefficient", c("int.neg.coef", "int.pos.coef"))
+sub.pos.long$moresig <- "Sig. in RhCMV+ only"
+sub.pos.long$CMV <- ifelse(sub.pos.long$CMV == "int.neg.coef", "NEG", "POS")
+
+sub.pos.long$Significance <- ifelse(sub.pos.long$CMV == "POS" & sub.pos.long$mod.check == "pass0.05" & sub.pos.long$CMVpos.p < 0.05 & sub.pos.long$CMVneg.p > 0.05,
+                            "Pinteraction < 0.05",
+                            ifelse(sub.pos.long$CMV == "POS" & sub.pos.long$mod.check == "pass0.1" & sub.pos.long$CMVpos.p < 0.05 & sub.pos.long$CMVneg.p > 0.05,
+                                   "Pinteraction < 0.1", "insignificant"))
+
+# combine all into one df
+sub.all <- rbind(sub.both.long, sub.neg.long, sub.pos.long)
+sub.all$Significance <- factor(sub.all$Significance, levels = c("insignificant", "Pinteraction < 0.1", "Pinteraction < 0.05"))
+
+# add function of bac
+sub.all <- dplyr::left_join(sub.all, scfa.func, by = "bac")
+sub.all$bac <- ifelse(sub.all$SCFA.production == "Gram+ producer", paste0(sub.all$bac, "a"),
+                     ifelse(sub.all$SCFA.production == "Gram- producer", paste0(sub.all$bac, "b"), sub.all$bac))
+
+# get order of bacterial genera based on clustering
+b.clus <- pe[pe$imm %in% imm.all & pe$bac %in% bac.all,]
+b.clus <- b.clus[,c("imm", "bac", "int.neg.coef")]
+b.clus <- tidyr::spread(b.clus, bac, int.neg.coef)
+row.names(b.clus) <- b.clus$imm
+b.clus <- b.clus[,-1]
+
+data.dist.bac <- as.dist(1-cor(b.clus))
+row.clus.bac <- hclust(data.dist.bac, method = "average")
+sub.all$bac <- factor(sub.all$bac, levels = levels(factor(sub.all$bac))[row.clus.bac$order])
+
+# order imm based on set colnames earlier
+sub.all$imm <- factor(sub.all$imm, levels = rev(colnames(imm)))
+
+# remove bac that doesn't have any significance in CMVneg
+drop.neg <- aggregate(sub.all$Significance[sub.all$CMV == "NEG"],
+          by = list(sub.all$bac[sub.all$CMV == "NEG"]),
+          function(x) sum(x != "insignificant"))
+drop.neg <- as.character(drop.neg$Group.1[drop.neg$x == 0])
+
+# remove bac that doesn't have any significance in CMVpos
+drop.pos <- aggregate(sub.all$Significance[sub.all$CMV == "POS"],
+          by = list(sub.all$bac[sub.all$CMV == "POS"]),
+          function(x) sum(x != "insignificant"))
+drop.pos <- as.character(drop.pos$Group.1[drop.pos$x == 0])
+
+sub.all.dropped <- sub.all[!((sub.all$bac %in% drop.neg & sub.all$CMV == "NEG") | (sub.all$bac %in% drop.pos & sub.all$CMV == "POS")),]
+sub.all.dropped$moresig <- factor(sub.all.dropped$moresig, levels = c("Sig. in RhCMV- only", "Sig. in RhCMV+ only", "Sig. in both"))
+
+fig4a <- ggplot(sub.all.dropped, aes(x = bac, y = imm, color = Coefficient, size = Significance)) +
+  geom_point(alpha = 0.9) +
+  scale_color_gradient2(mid = "grey") +
+  scale_size_manual(values = c(0, 1.5, 3)) +
+  facet_grid(moresig~CMV, scale = "free", space = "free",
+             labeller = labeller(CMV = t.labs)) +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0, hjust = 1),
+        legend.position = "bottom",
+        legend.box = "vertical",
+        legend.margin = margin(-5, 0, 0, 0),
+        legend.key.size = unit(10, "pt"),
+        legend.justification = c(1.3, 0))
+fig4a
+```
+
+
+## Fig 4B. Specific examples of SCFA producers vs. Treg/Th17
+```{r}
+scfat <- pe[pe$mod.check == "pass0.05" & pe$imm %in% c("CD25+CD127lo, CD4", "IL17+, CD4"),]
+
+scfat.list.df <- list()
+
+for (i in levels(factor(scfat$bac))){
+  # get df for making scatter plot
+  y <- data.frame(imm[,scfat$imm[scfat$bac == i]])
+  colnames(y) <- scfat$imm[scfat$bac == i]
+  df <- data.frame(mtdata, bac = bac[,i], y, check.names = FALSE)
+  long <- data.frame(tidyr::pivot_longer(df, cols = scfat$imm[scfat$bac == i], names_to = "imm", values_to = "values", ), check.names = FALSE)
+  # get annotation based on lm results
+  tmp <- scfat[scfat$bac == i,]
+  tmp1 <- tidyr::pivot_longer(tmp, cols = c("CMVneg.p", "CMVpos.p"), names_to = "CMV", values_to = "pval")
+  tmp2 <- tidyr::pivot_longer(tmp, cols = c("int.neg.coef", "int.pos.coef"), names_to = "CMV", values_to = "coef")
+  annot <- data.frame(CMV = rep(c("NEG", "POS"), times = nrow(tmp)),
+                      tmp1[,c("imm", "bac")],
+                      label = paste0(" P = ", round(tmp1$pval, 3), "\nCoef. = ", round(tmp2$coef, 3)))
+  annot$label[annot$CMV == "POS"] <- " P > 0.05"
+  scfat.list.df[[i]] <- list(df = long,
+                             annot = annot)
+}
+
+# save plots as list
+scfat.list.plot <- list()
+
+for (i in levels(factor(scfat$bac))){
+  scfat.list.plot[[i]] <- ggplot(scfat.list.df[[i]][["df"]], aes(x = bac, y = values)) +
+  geom_smooth(aes(color = CMV), method = lm, se = FALSE) +
+  geom_point(shape = 1, size = 0.8) +
+  facet_grid(imm~CMV, scale = "free", switch = "y",
+             labeller = labeller(CMV = t.labs)) +
+  scale_color_manual(values = set.color, limits = force) +
+  geom_text(data = scfat.list.df[[i]][["annot"]], aes(label = label, x = -Inf, y = Inf, vjust = 1.1, hjust = -0.05), size = 2, fontface = "italic") +
+  labs(title = i, x = "log(count + 1)", y = "Frequency (%)") +
+  theme(strip.background.y = element_blank(),
+        strip.placement = "outside",
+        legend.position = "none",
+        plot.title = element_text(size = 10, face = "bold.italic", margin = margin(0, 0, 2, 0)),
+        plot.margin = margin(2, 2, 2, 10, "pt"))
+}
+
+scfat.list.plot[["Bulleidia"]]
+scfat.list.plot[["Dialister"]]
+scfat.list.plot[["Faecalibacterium"]]
+scfat.list.plot[["Oribacterium"]]
+
+fig4b <- plot_grid(scfat.list.plot[["Bulleidia"]],
+                   scfat.list.plot[["Dialister"]],
+                   scfat.list.plot[["Oribacterium"]],
+                   scfat.list.plot[["Faecalibacterium"]],
+                   ncol = 1,
+                   labels = c("B", "", "", ""),
+                   label_size = 16, hjust = -0.1, vjust = 1.1)
+fig4b
+```
+
+
+## Fig 4C. Get the ones where both CMVneg and CMVpos are significant
+```{r fig4bc}
+# Get the ones where both CMVneg and CMVpos are significant
+sigpe <- pe[pe$mod.check == "pass0.05" & pe$CMVneg.p < 0.05 & pe$CMVpos.p < 0.05,]
+
+# save plot elements into list
+list.df <- list()
+
+for (i in levels(factor(sigpe$bac))){
+  # get df for making scatter plot
+  y <- data.frame(imm[,sigpe$imm[sigpe$bac == i]])
+  colnames(y) <- sigpe$imm[sigpe$bac == i]
+  df <- data.frame(mtdata, bac = bac[,i], y, check.names = FALSE)
+  long <- data.frame(tidyr::pivot_longer(df, cols = sigpe$imm[sigpe$bac == i], names_to = "imm", values_to = "values", ), check.names = FALSE)
+  # get annotation based on lm results
+  tmp <- sigpe[sigpe$bac == i,]
+  tmp1 <- tidyr::pivot_longer(tmp, cols = c("CMVneg.p", "CMVpos.p"), names_to = "CMV", values_to = "pval")
+  tmp2 <- tidyr::pivot_longer(tmp, cols = c("int.neg.coef", "int.pos.coef"), names_to = "CMV", values_to = "coef")
+  annot <- data.frame(CMV = rep(c("NEG", "POS"), times = nrow(tmp)),
+                      tmp1[,c("imm", "bac")],
+                      label = paste0(" P = ", round(tmp1$pval, 3), "\nCoef. = ", round(tmp2$coef, 3)))
+  list.df[[i]] <- list(df = long,
+                       annot = annot)
+}
+
+# save plots as list
+list.plot <- list()
+
+for (i in levels(factor(sigpe$bac))){
+  list.plot[[i]] <- ggplot(list.df[[i]][["df"]], aes(x = bac, y = values)) +
+  geom_smooth(aes(color = CMV), method = lm, se = FALSE) +
+  geom_point(shape = 1, size = 0.8) +
+  facet_grid(imm~CMV, scale = "free", switch = "y",
+             labeller = labeller(CMV = t.labs)) +
+  scale_color_manual(values = set.color, limits = force) +
+  geom_text(data = list.df[[i]][["annot"]], aes(label = label, x = -Inf, y = Inf, vjust = 1.1, hjust = -0.05), size = 2, fontface = "italic") +
+  labs(title = i, x = "log(count + 1)", y = "Frequency (%)") +
+  theme(strip.background.y = element_blank(),
+        strip.placement = "outside",
+        legend.position = "none",
+        plot.title = element_text(size = 10, face = "bold.italic", margin = margin(0, 0, 2, 0)),
+        plot.margin = margin(2, 2, 2, 10, "pt"))
+}
+
+list.plot[["Faecalibacterium"]]
+list.plot[["Oribacterium"]]
+list.plot[["Roseburia"]]
+
+fig4c <- plot_grid(list.plot[["Oribacterium"]], list.plot[["Roseburia"]], list.plot[["Faecalibacterium"]],
+                   ncol = 1, labels = c("C", "", ""),
+                   label_size = 16, hjust = -0.1, vjust = 1.1, rel_heights = c(1, 1, 1.4))
+fig4c
+```
+
+
+## Put all plots together
+```{r fig4, fig.show = "hide"}
+plot_grid(fig4a, fig4b, fig4c, nrow = 1, rel_widths = c(1, 0.7, 0.7), labels = c("A", "", ""),
+          label_size = 16, hjust = -0.1, vjust = 1.1)
+
+ggsave("211201_fig4.pdf", width = 9, height = 6.8, units = "in", device = "pdf")
+
+sessionInfo()
+```

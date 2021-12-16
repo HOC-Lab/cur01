@@ -1,0 +1,355 @@
+---
+title: "Fig 2"
+author: "Ning Chin"
+date: "10/1/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Setup
+```{r setup, warning = FALSE, message = FALSE}
+library(phyloseq)
+library(ggplot2)
+library(edgeR)
+library(tidyr)
+library(cowplot)
+library(glmnet)
+library(pROC)
+library(kableExtra)
+library(vegan)
+
+set.seed(7)
+
+set.color <- as.character(c("#DD1717", "#000249", "#FF4949", "#0F4392", 
+                            "#FCCDE5", "#8DD3C7", "#FFFFB3", "#80B1D3", "#FB8072", "#BC80BD",
+                            "#FFED6F", "#D9D9D9", "#BEBADA", "#CCEBC5", "#FDB462", "#B3DE69"))
+names(set.color) <- c("NEG", "POS", "prev", "posv",
+                      "Actinobacteria", "Bacteroidetes", "Cyanobacteria", "Elusimicrobia", "Fibrobacteres", "Firmicutes",
+                      "Proteobacteria", "Spirochaetes", "Tenericutes", "TM7", "Verrucomicrobia", "WPS-2")
+
+theme_set(theme_grey()+
+            theme(panel.grid = element_blank(),
+                  panel.background = element_blank(),
+                  panel.border = element_rect(fill = NA, colour = "black", size = 0.2),
+                  axis.title = element_text(size = 10),
+                  axis.text = element_text(size = 6),
+                  axis.line = element_line(color = "black", size = 0.2),
+                  legend.title = element_text(size = 8, face = "bold"),
+                  legend.text = element_text(size = 6),
+                  legend.key = element_blank(),
+                  legend.key.size = unit(10, "pt"),
+                  plot.margin = unit(c(5, 5, 5, 5), "pt")))
+```
+
+## Filtering
+```{r filt}
+filterfunc <- function(psobj, prevpercent, maxpercent) {
+  ps0 <- subset_taxa(psobj, !is.na(Phylum))
+  ps1 <- tax_glom(ps0, "Genus", NArm = TRUE)
+  prevalence <- apply(otu_table(ps1), 2, function(x) sum(x > 0)/nsamples(ps1))
+  maxpercentage <- apply(otu_table(ps1), 1, function(x) x/sum(x)*100)
+  maxpercentage <- apply(maxpercentage, 1, function(x) max(x))
+  keepTaxa <- names(prevalence)[(prevalence >= prevpercent & maxpercentage > maxpercent)]
+  ps2 <- prune_taxa(keepTaxa, ps1)
+  return(ps2)
+}
+
+ps0 <- readRDS("../phyloseq_GG_tree_190304.RData")
+dim(tax_table(ps0))
+ps <- filterfunc(ps0, 0.05, 0.01)
+ps.ra <- transform_sample_counts(ps, function(x) x / sum(x) * 100)
+dim(tax_table(ps))
+mtdata <- read.csv("../metadata.csv", stringsAsFactors = TRUE)
+taxa <- data.frame(tax_table(ps))
+
+# CMV38 data
+vac0 <- readRDS("../../CMV38/phyloseq_GG_tree.RData")
+vac <- filterfunc(vac0, 0.05, 0.01)
+vac.ra <- transform_sample_counts(vac, function(x) x / sum(x) * 100)
+vacmtdata <- read.csv("../../CMV38/metadata.csv")
+vacmtdata$Timepoint <- factor(vacmtdata$Timepoint, levels = c("prev", "posv"))
+```
+
+```{r limma-voom}
+limmafunc <- function(psobj) {
+  m <- t(otu_table(psobj))
+  d <- DGEList(counts = m, genes = data.frame(as(tax_table(psobj),"matrix"), stringsAsFactors = FALSE))
+  mm <- model.matrix(~ CMV, data = data.frame(sample_data(psobj), stringsAsFactors = FALSE))
+  y <- voom(d, mm, plot = TRUE)
+  fit <- lmFit(y, mm)
+  contr <- makeContrasts(CMVPOS, levels = colnames(coef(fit)))
+  tmp <- contrasts.fit(fit, contr)
+  tmp <- eBayes(tmp)
+  tmp2 <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+  return(tmp2)
+}
+
+lim <- limmafunc(ps)
+lim$Phylum <- gsub("p__", "", lim$Phylum)
+lim$Genus <- gsub("g__", "", lim$Genus)
+```
+
+
+## Fig 2A. Waterfall plot for significantly changed taxa
+```{r 2a}
+sigp <- lim[lim$P.Value < 0.05,]
+sigp$Genus <- factor(sigp$Genus, levels = sigp$Genus[order(sigp$logFC, decreasing = TRUE)])
+sigp$sig <- ifelse(sigp$adj.P.Val < 0.1, "*", "")
+sigp$sig.y.val <- ifelse(sigp$logFC > 0, sigp$logFC, 0)
+
+kable(sigp, row.names = 0) %>% kable_styling()
+
+fig2a <- ggplot(sigp, aes(x = Genus, y = logFC, fill = Phylum)) +
+  geom_col(position = "dodge", color = "black", size = 0.2) +
+  geom_text(aes(y = sig.y.val), label = sigp$sig, size = 7) +
+  labs(y = "log2 FC") +
+  ylim(-2.3, 2.7) +
+  scale_fill_manual(values = set.color, limits = force) +
+  theme(panel.border = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 8, face = "italic"),
+        legend.position = "none") +
+  annotate("text",  x = Inf, y = Inf, fontface = "italic",
+           vjust = 1.2, hjust = 1.2, 
+           size = 2,
+           label = "* adj. P < 0.1")
+fig2a
+
+# make legend that include all 6 phylum
+fig2.legend <- ggplot(lim, aes(x = Genus, y = logFC, fill = Phylum)) +
+  geom_col(color = "black", size = 0.2) +
+  scale_fill_manual(values = set.color, limits = force) +
+  guides(fill = guide_legend(nrow = 2)) +
+  theme(legend.position = "bottom",
+        legend.margin = margin(-10, 0, -5, 0))
+```
+
+
+## Run elastic net logistic regression for feature selection
+```{r}
+# use CUR01 as training set and CMV38 as testing set
+# keep common genus only
+keep <- intersect(data.frame(tax_table(ps), stringsAsFactors = FALSE)$Genus, data.frame(tax_table(vac), stringsAsFactors = FALSE)$Genus)
+
+# train set from CUR01
+bac.train <- data.frame(otu_table(ps.ra))
+colnames(bac.train) <- data.frame(tax_table(ps), stringsAsFactors = FALSE)$Genus
+x.train <- scale(bac.train[,keep])
+y.train <- mtdata$CMV
+
+# test set from CMV38
+bac.test <- data.frame(otu_table(vac.ra))
+colnames(bac.test) <- data.frame(tax_table(vac), stringsAsFactors = FALSE)$Genus
+x.test <- scale(bac.test[,keep])
+y.test <- as.factor(ifelse(vacmtdata$Timepoint == "prev", "NEG", "POS"))
+
+# test a range of alpha and select one with minimum cross-validation error
+# alphas to be tested (0 = ridge, 1 = lasso)
+results <- data.frame(alpha = seq(0, 1, 0.05), cvm = 0)
+list.of.fits <- list()
+
+for (i in 1:nrow(results)){
+  # perform 10-fold cross-validation
+  fit <- cv.glmnet(x.train, y.train, family = "binomial", type.measure = "class", alpha = results$alpha[i], standardize = FALSE, nfolds = 10)
+  # save results to data.frame
+  results$cvm[i] <- fit$cvm[fit$lambda == fit$lambda.1se]
+  # save model in case we need it later
+  list.of.fits[[paste0("alpha", results$alpha[i])]] <- fit
+}
+
+# extract the optimal cross-validated model
+op.fit <- list.of.fits[[paste0("alpha", results$alpha[results$cvm == min(results$cvm)])]]
+
+# plot cross-validation results
+plot(op.fit)
+```
+
+
+## Fig 2B. Plot coefficient of ENR selected features
+```{r}
+enr.res <- coef(op.fit)
+enr.res <- data.frame(Genus = enr.res@Dimnames[[1]][enr.res@i + 1], Coefficient = enr.res@x)[-1,]
+enr.res <- dplyr::right_join(taxa, enr.res, by = "Genus")
+enr.res$Genus <- gsub("g__", "", enr.res$Genus)
+enr.res$Genus <- factor(enr.res$Genus, levels = enr.res$Genus[order(enr.res$Coefficient, decreasing = TRUE)])
+enr.res$Phylum <- gsub("p__", "", enr.res$Phylum)
+kable(enr.res) %>% kable_styling()
+
+fig2b <- ggplot(enr.res, aes(x = Genus, y = Coefficient, fill = Phylum)) +
+  geom_col(position = "dodge", color = "black", size = 0.2) +
+  scale_fill_manual(values = set.color, limits = force) +
+  scale_y_continuous(limit = c(-1.2, 0.4), expand = expansion(mult = c(0,0), add = c(0.01, 0.02))) +
+  theme(panel.border = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 8, face = "italic"),
+        legend.position = "none")
+fig2b
+
+# get cmv_score - save for use later
+cmv_score <- predict(op.fit, s = op.fit$lambda.1se, newx = x.train, type = "response")
+#saveRDS(cmv_score, "cmv_score.RData")
+```
+
+
+## Fig 2C. PCA for significantly changed taxa in CUR01
+```{r}
+# subset what we're interested in
+sigbac <- paste0("g__", enr.res$Genus)
+ps.sig <- subset_taxa(ps, Genus %in% sigbac)
+
+# get log transformed counts
+ps.log <- transform_sample_counts(ps.sig, function(x) log2(x + 1))
+
+logbac <- data.frame(otu_table(ps.log))
+colnames(logbac) <- data.frame(as(tax_table(ps.log), "matrix"), stringsAsFactors = FALSE)$Genus
+
+pca <- prcomp(logbac, scale. = TRUE)
+out <- cbind(mtdata, as.data.frame(pca$x))
+percentage <- round(pca$sdev^2 / sum(pca$sdev^2) * 100, 2)
+
+eu <- dist(logbac)
+
+fig2c <- ggplot(out, aes(x = PC1, y = PC2)) +
+  geom_point(size = 2, alpha = 0.8, aes(color = CMV)) +
+  labs(x = paste("PC1 (", percentage[1], "%)", sep = ""),
+       y = paste("PC2 (", percentage[2], "%)", sep = ""),
+       title = "Training set",
+       subtitle = "RhCMV- vs. RhCMV+") +
+  scale_color_manual(values = set.color, limits = force, name = "RhCMV") +
+  theme(legend.position = c(1, 1),
+        legend.justification = c(1, 1),
+        legend.background = element_rect(color = "black", size = 0.2),
+        legend.spacing.y = unit(1, "pt"),
+        legend.margin = margin(0, 2, 0, 2),
+        aspect.ratio = 1,
+        plot.title = element_text(size = 12, face = "bold", margin = margin(0, 0, 0, 0)),
+        plot.subtitle = element_text(size = 8, face = "italic", margin = margin(0, 0, -6, 0), hjust = 1, vjust = 6)) +
+  annotate("text",  x = -Inf, y = Inf, fontface = "italic",
+           vjust = 1.4, hjust = -0.2, size = 2,
+           label = paste0("P = ",
+                    round(adonis(eu ~ CMV, data = out, method = "eu")$aov.tab$`Pr(>F)`[1],3)))
+fig2c
+
+# beta-disper p-value
+round(permutest(betadisper(eu, mtdata$CMV))$tab$'Pr(>F)'[1], 3)
+```
+
+
+## Fig 2D. AUC curve for ENR
+```{r}
+# apply on test set, graph AUC curve with confidence interval of sensitivities
+predicted <- predict(op.fit, s = op.fit$lambda.1se, newx = x.test, type = "response")
+enr.auc <- roc(y.test, as.numeric(predicted), ci = TRUE)
+enr.obj <- ci.se(enr.auc)
+
+# extract auc info for ggplot
+enr.df <- coords(enr.auc, "all", transpose = FALSE)
+enr.df <- enr.df[rev(seq(nrow(enr.df))),]
+
+# extract confidence interval of sensitivities
+dat.enr <- data.frame(x = as.numeric(rownames(enr.obj)),
+                      lower = enr.obj[,1],
+                      upper = enr.obj[,3])
+
+auc.lab <- paste0("AUC:", round(enr.auc$auc, 3), "\n (", round(enr.auc$ci[[1]], 3), "-", round(enr.auc$ci[[3]], 3), ")")
+
+# turn into ggplot object
+fig2d <- ggplot() +
+  geom_rect(aes(xmin = 0, xmax = 1, ymin = 0, ymax = 1), fill = "grey86") +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "grey30") +
+  geom_ribbon(data = dat.enr, aes(x = x, ymin = lower, ymax = upper),
+              fill = "#534582", alpha = 0.2) +
+  geom_line(data = enr.df, aes(x = specificity, y = sensitivity), color = "#221C35", size = 1) +
+  xlab("Specificity") +
+  ylab("Sensitivity") +
+  scale_x_reverse(lim=c(1, 0)) +
+  annotate("text", x = 0.5, y = 0.5, fontface = "italic",
+           vjust = 0.5, hjust = -0.5,
+           size = 2,
+           label = auc.lab) +
+  theme(aspect.ratio = 1)
+fig2d
+
+# stat for AUC using DeLong, DeLong, and Clarke-Pearson (1988) method
+z <- (enr.auc$auc - 0.5)/sqrt(var(enr.auc$ci))
+2 * pt(-abs(z), df=Inf)
+```
+
+
+## Fig 2E. ENR score for both training and testing set
+```{r}
+enr.score.train <- data.frame(Group = mtdata$CMV, AnimalID = mtdata$AnimalID, cmv_score)
+enr.score.test <- data.frame(Group = vacmtdata$Timepoint, AnimalID = vacmtdata$AnimalID, predicted)
+
+enr.score <- rbind(enr.score.train, enr.score.test)
+enr.score$Group <- factor(enr.score$Group, levels = c("NEG", "POS", "prev", "posv"))
+
+fig2e <- ggplot(enr.score, aes(x = Group, y = s1, fill = Group)) +
+  geom_boxplot(outlier.size = NA, alpha = 0.8) +
+  geom_point(aes(color = Group), size = 2) +
+  scale_fill_manual(values = set.color, limits = force, guide = "none") +
+  scale_color_manual(values = set.color, limits = force, guide = "none") +
+  scale_x_discrete(labels = c("NEG" = "RhCMV-",
+                              "POS" = "RhCMV+",
+                              "prev" = "Pre-vacc.",
+                              "posv" = "Post-vacc.")) +
+  labs(y = "CMV-microbial score") +
+  theme(aspect.ratio = 1)
+fig2e
+```
+
+
+## Fig 2F. PCA for significantly changed taxa in CMV38
+```{r}
+# get log transformed counts from CMV38
+vac.sig <- subset_taxa(vac, Genus %in% sigbac)
+vac.log <- transform_sample_counts(vac.sig, function(x) log2(x + 1))
+
+logbac.vac <- data.frame(otu_table(vac.log))
+colnames(logbac.vac) <- data.frame(as(tax_table(vac.log), "matrix"), stringsAsFactors = FALSE)$Genus
+
+vac.pca <- prcomp(logbac.vac, scale. = TRUE)
+vac.out <- cbind(vacmtdata, as.data.frame(vac.pca$x))
+vac.percentage <- round(vac.pca$sdev^2 / sum(vac.pca$sdev^2) * 100, 2)
+
+vac.eu <- dist(logbac.vac)
+
+fig2f <- ggplot(vac.out, aes(x = PC1, y = PC2)) +
+  geom_point(size = 2, alpha = 0.8, aes(color = Timepoint)) +
+  labs(x = paste("PC1 (", vac.percentage[1], "%)", sep = ""),
+       y = paste("PC2 (", vac.percentage[2], "%)", sep = ""),
+       title = "Testing set",
+       subtitle = "Pre- vs. post-vaccination") +
+  scale_color_manual(name = "Vacc.", values = set.color, limits = force, labels = c("Pre-", "Post-")) +
+  theme(legend.position = c(1, 1),
+        legend.justification = c(1, 1),
+        legend.background = element_rect(color = "black", size = 0.2),
+        legend.spacing.y = unit(1, "pt"),
+        legend.margin = margin(0, 2, 0, 2),
+        aspect.ratio = 1,
+        plot.title = element_text(size = 12, face = "bold", margin = margin(0, 0, 0, 0)),
+        plot.subtitle = element_text(size = 8, face = "italic", margin = margin(0, 0, -6, 0), hjust = 1, vjust = 6)) +
+  annotate("text",  x = -Inf, y = Inf, fontface = "italic",
+           vjust = 1.4, hjust = -0.2, size = 2,
+           label = paste0("P = ",
+                    round(adonis(vac.eu ~ Timepoint, data = vac.out, method = "eu")$aov.tab$`Pr(>F)`[1],3)))
+fig2f
+
+# beta-disper p-value
+round(permutest(betadisper(vac.eu, vacmtdata$Timepoint))$tab$'Pr(>F)'[1], 3)
+```
+
+## Put all plots together
+```{r fig2, fig.show = "hide"}
+fig2ab <- plot_grid(fig2a, fig2b, nrow = 1, labels = c("A", "B"), label_size = 16, hjust = -0.1, vjust = 1.1, rel_widths = c(2, 3), align = "h")
+fig2ab <- plot_grid(fig2ab, get_legend(fig2.legend), ncol = 1, rel_heights = c(6, 1))
+
+fig2abc <- plot_grid(fig2ab, fig2c, nrow = 1, labels = c("", "C"), label_size = 16, hjust = -0.1, vjust = 1.1, rel_widths = c(2, 1))
+
+fig2def <- plot_grid(fig2d, fig2e, fig2f, labels = c("D", "E", "F"), label_size = 16, hjust = -0.1, vjust = 1.1, nrow = 1, align = "h")
+
+plot_grid(fig2abc, fig2def, ncol = 1, align = "hv")
+
+ggsave("211110_fig2.pdf", width = 9, height = 6.5, units = "in", device = "pdf")
+
+sessionInfo()
+```
